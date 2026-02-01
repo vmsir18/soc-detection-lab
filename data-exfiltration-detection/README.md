@@ -1,4 +1,4 @@
-### Sensitive Data Exfiltration Detection (Anomalous File & Network Access)
+# Sensitive Data Exfiltration Detection (Anomalous File & Network Access)
 
 ## My Detection Approach
 

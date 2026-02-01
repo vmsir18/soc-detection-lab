@@ -1,3 +1,4 @@
+### Sensitive Data Exfiltration Detection (Anomalous File & Network Access)
 
 ## My Detection Approach
 
@@ -11,7 +12,7 @@ I primarily look at three things:
 
 Individually these signals may not be malicious, but when they occur together, they strongly indicate possible data exfiltration.
 
-### Common False Positives 
+## Common False Positives 
 
 In my experience, most alerts from this detection end up being:
 - Legitimate cloud backups

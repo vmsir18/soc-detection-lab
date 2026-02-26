@@ -28,7 +28,7 @@
 
 ## What This Project Is About
 
-This project focuses on detecting **real-world phishing attacks** across the full kill chain — not just email filtering.
+This project focuses on detecting **real-world phishing attacks** across the full kill chain using **IBM QRadar's built-in rule engine, offense manager, log activity filters, and reference sets** — without relying on complex AQL queries.
 
 This includes:
 - **Email authentication failures** - Spoofed senders failing SPF, DKIM, DMARC
@@ -59,23 +59,34 @@ Individually, these look like noise.
 ### Rule 1: Suspicious Inbound Email — Auth Failures
 
 **Detection Logic:**  
-Identify inbound emails where SPF and DKIM both fail from an untrusted sending server.
+Use QRadar's Log Activity view to filter inbound mail gateway events where SPF and DKIM both fail.
 
-**QRadar AQL Query:**
-```sql
-SELECT sourceip AS 'Sending IP',
-       username AS 'Recipient',
-       'email_sender' AS 'From Address',
-       'spf_result' AS 'SPF',
-       'dkim_result' AS 'DKIM',
-       starttime AS 'Time'
-FROM events
-WHERE LOGSOURCETYPENAME(devicetype) IN ('ProofPoint Protection Server', 'Mimecast')
-  AND 'spf_result' IN ('fail', 'softfail')
-  AND 'dkim_result' = 'fail'
-  AND sourceip NOT IN REFERENCESET('Trusted_Mail_Servers')
-LAST 1 HOURS
-ORDER BY starttime DESC
+**QRadar Log Activity — Quick Filter:**
+```
+Log Source Type  : ProofPoint Protection Server OR Mimecast
+Custom Property  : SPF_Result = 'fail' OR 'softfail'
+Custom Property  : DKIM_Result = 'fail'
+Source IP        : NOT in Reference Set 'Trusted_Mail_Servers'
+```
+
+**QRadar Custom Rule (Rule Wizard):**
+```
+Rule Name  : PHI-001 | Suspicious Email - Auth Failures
+
+When the following events are detected:
+  AND when the Log Source type is one of: Proofpoint, Mimecast
+  AND when the Custom Property SPF_Result is one of: fail, softfail
+  AND when the Custom Property DKIM_Result is: fail
+  AND when the Source IP is NOT contained in Reference Set: Trusted_Mail_Servers
+
+Apply on: Events
+Group by: Username (Recipient)
+
+Actions:
+  - Contribute to Offense: named by Username
+  - Add Username to Reference Set: Active_Phishing_Recipients (TTL: 2 hours)
+  - Set Offense Severity: 7
+  - Set Offense Credibility: 8
 ```
 
 **What This Detects:**
@@ -98,37 +109,48 @@ ORDER BY starttime DESC
 ### Rule 2: Phishing Link Click Detected via Proxy
 
 **Detection Logic:**  
-Detect when a user navigates to a phishing URL and receives HTTP 200 — meaning they successfully reached the phishing page.
+Filter proxy log events in QRadar Log Activity for phishing/malicious URL categories with HTTP 200 responses, correlated against users who received suspicious emails.
 
-**QRadar AQL Query:**
-```sql
-SELECT username AS 'User',
-       sourceip AS 'Workstation IP',
-       URL AS 'Clicked URL',
-       'url_category' AS 'Category',
-       'http_response_code' AS 'HTTP Status',
-       starttime AS 'Time'
-FROM events
-WHERE LOGSOURCETYPENAME(devicetype) IN ('Zscaler', 'Bluecoat Proxy', 'Squid')
-  AND 'url_category' IN ('Phishing', 'Malicious', 'Newly Registered Domain')
-  AND 'http_response_code' = '200'
-  AND username IN REFERENCESET('Active_Phishing_Recipients')
-LAST 30 MINUTES
-ORDER BY starttime DESC
+**QRadar Log Activity — Quick Filter:**
+```
+Log Source Type  : Zscaler OR Bluecoat Proxy OR Squid
+URL Category     : Phishing OR Malicious OR Newly Registered Domain
+HTTP Status Code : 200
+Username         : contained in Reference Set 'Active_Phishing_Recipients'
+```
+
+**QRadar Custom Rule (Rule Wizard):**
+```
+Rule Name  : PHI-002 | Phishing Link Click
+
+When the following events are detected:
+  AND when the Log Source type is one of: Zscaler, Bluecoat, Squid
+  AND when the Custom Property URL_Category is one of: Phishing, Malicious, Newly Registered Domain
+  AND when the Custom Property HTTP_Response_Code is: 200
+  AND when the Username is contained in Reference Set: Active_Phishing_Recipients
+
+Apply on: Events
+Group by: Username
+
+Actions:
+  - Contribute to existing Offense (from PHI-001)
+  - Add Username to Reference Set: Users_Who_Clicked_Phishing (TTL: 4 hours)
+  - Increase Offense Severity to: 9 (CRITICAL)
+  - Notify: SOC via email notification
 ```
 
 **What This Detects:**
-- Users successfully navigating to phishing pages
-- Clicks on malicious links from phishing emails
-- Access to newly registered domains used in campaigns
+- Users successfully reaching phishing pages
+- Malicious link clicks correlated with suspicious email receipt
+- Access to newly registered phishing domains
 
 **False Positive Scenarios:**
 - Newly registered but legitimate business domains
-- URL categorization errors from proxy vendor
+- URL categorization lag from proxy vendor
 
 **Response Actions:**
-1. Confirm URL is malicious via VirusTotal
-2. Check if user submitted any data after visiting (Rule 3)
+1. Confirm URL is malicious via VirusTotal / threat intel
+2. Check if user submitted data after visiting (Rule 3)
 3. Add domain to `Known_Phishing_Domains` reference set
 4. Notify user and manager immediately
 
@@ -137,34 +159,46 @@ ORDER BY starttime DESC
 ### Rule 3: Credential Submission to External Site
 
 **Detection Logic:**  
-Detect HTTP POST requests with data sent to suspicious external domains — strongest indicator credentials were submitted to a phishing page.
+Filter proxy events for HTTP POST requests with significant bytes sent to uncategorized or phishing-classified external domains — strongest sign of credential theft.
 
-**QRadar AQL Query:**
-```sql
-SELECT username AS 'User',
-       sourceip AS 'Source IP',
-       URL AS 'Destination URL',
-       'bytes_sent' AS 'Data Sent (bytes)',
-       'url_category' AS 'Category',
-       starttime AS 'Time'
-FROM events
-WHERE LOGSOURCETYPENAME(devicetype) IN ('Zscaler', 'Bluecoat Proxy')
-  AND 'http_method' = 'POST'
-  AND 'bytes_sent' > 100
-  AND DOMAINOF(URL) NOT IN REFERENCESET('Approved_SaaS_Domains')
-  AND 'url_category' IN ('Phishing', 'Newly Registered Domain', 'Uncategorized')
-LAST 24 HOURS
-ORDER BY starttime DESC
+**QRadar Log Activity — Quick Filter:**
+```
+Log Source Type  : Zscaler OR Bluecoat Proxy
+HTTP Method      : POST
+Bytes Sent       : > 100
+Destination      : NOT in Reference Set 'Approved_SaaS_Domains'
+URL Category     : Phishing OR Uncategorized OR Newly Registered Domain
+```
+
+**QRadar Custom Rule (Rule Wizard):**
+```
+Rule Name  : PHI-003 | Credential Submission to Suspicious Site
+
+When the following events are detected:
+  AND when the Log Source type is one of: Zscaler, Bluecoat Proxy
+  AND when the Custom Property HTTP_Method is: POST
+  AND when the Custom Property Bytes_Sent is greater than: 100
+  AND when the Destination is NOT contained in Reference Set: Approved_SaaS_Domains
+  AND when the Custom Property URL_Category is one of: Phishing, Uncategorized, Newly Registered
+
+Apply on: Events
+Group by: Username
+
+Actions:
+  - Contribute to existing Offense (from PHI-001 / PHI-002)
+  - Add Username to Reference Set: Credential_Compromise_Suspected (TTL: 24 hours)
+  - Set Offense Severity to: 10 (CRITICAL)
+  - Trigger SOAR: Force password reset workflow
 ```
 
 **What This Detects:**
-- Users submitting login credentials to phishing pages
+- Credentials submitted to phishing login pages
 - Form data sent to suspicious external domains
-- Credential harvesting via fake login portals
+- Credential harvesting via fake portals
 
 **False Positive Scenarios:**
-- Web forms on newly registered but legitimate sites
-- New SaaS tools not yet added to approved list
+- Web forms on new but legitimate sites
+- New SaaS tools not yet in approved list
 
 **Response Actions:**
 - Force immediate password reset for affected user
@@ -176,31 +210,47 @@ ORDER BY starttime DESC
 ### Rule 4: Malicious Attachment — Macro Execution
 
 **Detection Logic:**  
-Detect Office applications spawning shells or scripting engines — almost always a malicious macro triggered by a phishing attachment.
+Use QRadar's pre-built Windows Event Log rules or create a custom rule filtering EventID 4688 where Office applications spawn scripting engines.
 
-**QRadar AQL Query:**
-```sql
-SELECT username AS 'User',
-       'parent_process' AS 'Parent Process',
-       'process_name' AS 'Child Process',
-       'command_line' AS 'Command Line',
-       starttime AS 'Time'
-FROM events
-WHERE LOGSOURCETYPENAME(devicetype) = 'Microsoft Windows Security Event Log'
-  AND EventID = 4688
-  AND 'parent_process' IN ('WINWORD.EXE', 'EXCEL.EXE', 'OUTLOOK.EXE', 'ACRORD32.EXE')
-  AND 'process_name' IN ('cmd.exe', 'powershell.exe', 'wscript.exe', 'mshta.exe')
-LAST 24 HOURS
-ORDER BY starttime DESC
+**QRadar Log Activity — Quick Filter:**
+```
+Log Source Type  : Microsoft Windows Security Event Log
+Event ID         : 4688
+Custom Property  : Parent_Process = WINWORD.EXE OR EXCEL.EXE OR OUTLOOK.EXE
+Custom Property  : Child_Process = powershell.exe OR cmd.exe OR wscript.exe OR mshta.exe
+```
+
+**QRadar Custom Rule (Rule Wizard):**
+```
+Rule Name  : PHI-004 | Macro Execution from Office Application
+
+When the following events are detected:
+  AND when the Log Source type is: Microsoft Windows Security Event Log
+  AND when the Event ID is: 4688
+  AND when the Custom Property Parent_Process is one of:
+      WINWORD.EXE, EXCEL.EXE, POWERPNT.EXE, OUTLOOK.EXE, ACRORD32.EXE
+  AND when the Custom Property Child_Process is one of:
+      cmd.exe, powershell.exe, wscript.exe, cscript.exe, mshta.exe
+  AND when the Username is contained in Reference Set: Active_Phishing_Recipients
+      (within 2 hours)
+
+Apply on: Events
+Group by: Hostname
+
+Actions:
+  - Create new CRITICAL Offense: named by Hostname
+  - Set Offense Severity to: 10
+  - Notify: IR Team via email
+  - Trigger SOAR: Endpoint isolation workflow
 ```
 
 **What This Detects:**
-- Office apps spawning PowerShell or CMD — malicious macro execution
+- Office apps spawning PowerShell or CMD — malicious macro confirmed
 - Fileless payload delivery via `mshta.exe` or `wscript.exe`
 - PDF readers launching scripts after malicious file open
 
 **False Positive Scenarios:**
-- Legitimate business macros used by finance or HR
+- Legitimate business macros used by finance or HR teams
 - IT admin scripts triggered via Office automation
 
 **Response Actions:**
@@ -214,22 +264,37 @@ ORDER BY starttime DESC
 ### Rule 5: Post-Phish Account Takeover — Impossible Travel
 
 **Detection Logic:**  
-After credential submission, detect a successful login from a geographically impossible location within 60 minutes — confirming stolen credentials are actively being abused.
+Use QRadar's built-in Anomaly Detection rules or configure a custom rule on identity provider logs to detect successful logins from countries inconsistent with the user's normal location — correlated against credential compromise events.
 
-**QRadar AQL Query:**
-```sql
-SELECT username AS 'User',
-       sourceip AS 'Login IP',
-       'login_country' AS 'Country',
-       'login_city' AS 'City',
-       starttime AS 'Login Time'
-FROM events
-WHERE LOGSOURCETYPENAME(devicetype) IN ('Microsoft Azure AD', 'Okta')
-  AND EventID IN (4624, 'SuccessfulSignIn')
-  AND username IN REFERENCESET('Credential_Compromise_Suspected')
-  AND 'login_country' != 'IN'
-LAST 2 HOURS
-ORDER BY starttime DESC
+**QRadar Log Activity — Quick Filter:**
+```
+Log Source Type  : Microsoft Azure AD OR Okta
+Event ID         : 4624 OR SuccessfulSignIn
+Username         : contained in Reference Set 'Credential_Compromise_Suspected'
+Custom Property  : Login_Country NOT EQUAL TO 'IN'
+```
+
+**QRadar Custom Rule (Rule Wizard):**
+```
+Rule Name  : PHI-005 | Post-Phish Impossible Travel
+
+Sequence Rule — detect in order:
+  Event A:
+    Username is contained in Reference Set: Credential_Compromise_Suspected
+
+  THEN Event B within 60 minutes:
+    AND Log Source type is one of: Microsoft Azure AD, Okta
+    AND Event ID is one of: 4624, SuccessfulSignIn
+    AND Custom Property Login_Country is NOT: IN
+
+Apply on: Events
+Group by: Username
+
+Actions:
+  - Create new P1 Offense: named by Username
+  - Add Username to Reference Set: Confirmed_Compromise
+  - Set Offense Severity to: 10 (CRITICAL)
+  - Trigger SOAR: Session revocation + MFA re-enrollment
 ```
 
 **What This Detects:**
@@ -239,7 +304,7 @@ ORDER BY starttime DESC
 
 **False Positive Scenarios:**
 - Employees traveling internationally
-- Users connected via VPN with foreign exit nodes
+- Users on VPN with foreign exit nodes
 
 **Response Actions:**
 - Revoke all active sessions immediately via SOAR
@@ -255,16 +320,16 @@ ORDER BY starttime DESC
 ```
 09:14 AM - Phishing email arrives — From: security@m1crosoft.com
            SPF: fail | DKIM: fail | DMARC: fail
-           → Rule 1 FIRES | User added to Active_Phishing_Recipients
+           → PHI-001 FIRES | User added to Active_Phishing_Recipients
 
 09:17 AM - User clicks link — GET http://login-microsofft.com → HTTP 200
-           → Rule 2 FIRES | Severity elevated to HIGH
+           → PHI-002 FIRES | Severity elevated to HIGH
 
 09:18 AM - User submits credentials — POST 847 bytes to phishing page
-           → Rule 3 FIRES | CRITICAL | Password reset triggered via SOAR
+           → PHI-003 FIRES | CRITICAL | Password reset triggered via SOAR
 
 09:51 AM - Login from Moscow, Russia (user is based in India)
-           → Rule 5 FIRES | Session revoked | P1 Incident created
+           → PHI-005 FIRES | Session revoked | P1 Incident created
 
 Result: Attack fully detected and contained in 37 minutes.
 ```
@@ -274,30 +339,30 @@ Result: Attack fully detected and contained in 37 minutes.
 ## SOC Investigation Checklist
 
 **Phase 1: Triage (5 minutes)**
-- [ ] Check SPF / DKIM / DMARC results in mail gateway logs
-- [ ] How many users received the same phishing email?
-- [ ] Did any user click the link? Check `Users_Who_Clicked_Phishing`
+- [ ] Open Offense in QRadar Offense Manager — check contributing events
+- [ ] Check SPF / DKIM results in Log Activity (filter: Log Source = Mimecast/Proofpoint)
+- [ ] How many users in Reference Set `Active_Phishing_Recipients`?
 - [ ] Did any user submit credentials? Check `Credential_Compromise_Suspected`
 
 **Phase 2: Scope Assessment (10 minutes)**
-- [ ] How many users are in the same phishing campaign?
-- [ ] Were credentials submitted — POST event with bytes > 100?
-- [ ] Was there macro execution on the endpoint — EventID 4688?
-- [ ] Any logins from new countries after credential submission?
+- [ ] Filter Log Activity — URL Category = Phishing, last 1 hour
+- [ ] Check for HTTP POST events from affected users to external domains
+- [ ] Review EventID 4688 for Office spawning child processes
+- [ ] Check Azure AD / Okta for logins from new countries
 
 **Phase 3: Containment (10 minutes)**
-- [ ] Block phishing domain — add to `Known_Phishing_Domains`
-- [ ] Retract phishing email from all mailboxes via mail gateway
-- [ ] Force password reset for users in `Credential_Compromise_Suspected`
-- [ ] Revoke active sessions and isolate endpoint if macro executed
+- [ ] Add phishing domain to `Known_Phishing_Domains` reference set
+- [ ] Request mail gateway to retract email from all mailboxes
+- [ ] Force password reset for all users in `Credential_Compromise_Suspected`
+- [ ] Revoke active sessions and isolate endpoint if macro execution confirmed
 
 **Phase 4: Escalation Decision**
 - **Escalate to Tier 2 if:**
-  - User clicked phishing link and reached the page (HTTP 200)
-  - Credentials submitted to external site (Rule 3 fired)
-  - Macro execution detected on endpoint (Rule 4 fired)
+  - User reached phishing page — HTTP 200 confirmed
+  - Credentials submitted — Rule PHI-003 fired
+  - Macro execution on endpoint — Rule PHI-004 fired
 - **Escalate to Incident Response immediately if:**
-  - Impossible travel login detected (Rule 5 fired)
+  - Impossible travel login confirmed — Rule PHI-005 fired
   - Lateral movement detected post-compromise
   - Executive or VIP account compromised
 
@@ -341,10 +406,10 @@ This detection is **behavior-based and cross-source** — it catches what email 
 ## References
 
 - **MITRE ATT&CK**: https://attack.mitre.org/techniques/T1566/
-- **IBM QRadar AQL Docs**: https://www.ibm.com/docs/en/qsip/7.5?topic=overview-aql
+- **IBM QRadar Rule Wizard Guide**: https://www.ibm.com/docs/en/qsip/7.5?topic=rules-qradar
+- **IBM QRadar Reference Sets**: https://www.ibm.com/docs/en/qsip/7.5?topic=sets-reference
 - **CISA Phishing Guidance**: https://www.cisa.gov/topics/cyber-threats-and-advisories/phishing
-- **OWASP Phishing Guide**: https://owasp.org/www-community/attacks/Phishing
 
 ---
 
-*Detection rules tested against real-world phishing campaigns including BEC, credential harvesting, spearphishing, and macro-based initial access vectors.*
+*Detection rules built using QRadar Rule Wizard, Log Activity filters, and Reference Sets — tested against real-world phishing campaigns including BEC, credential harvesting, and macro-based initial access.*
